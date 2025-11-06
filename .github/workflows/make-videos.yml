@@ -1,0 +1,41 @@
+name: Make & Upload Forex Videos (FREE)
+
+on:
+  # Run hourly; the Python script will decide what to publish now.
+  schedule:
+    - cron: '0 * * * *'   # Every hour (GitHub Actions uses UTC)
+  workflow_dispatch: {}     # Manual Run button
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        # Official action page: https://github.com/actions/checkout
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+        # Official action page: https://github.com/actions/setup-python
+
+      - name: Install system tools (FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install moviepy google-api-python-client google-auth google-auth-oauthlib requests pandas pytz
+
+      - name: Run generator
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: |
+          python make_videos.py
