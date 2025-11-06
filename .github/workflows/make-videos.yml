@@ -3,7 +3,7 @@ name: Make & Upload Forex Videos (FREE)
 on:
   # Run hourly; the Python script will decide what to publish now.
   schedule:
-    - cron: '0 * * * *'   # Every hour (GitHub Actions uses UTC)
+    - cron: '5 * * * *'   # Every hour (GitHub Actions uses UTC)
   workflow_dispatch: {}     # Manual Run button
 
 jobs:
@@ -32,6 +32,14 @@ jobs:
           pip install moviepy google-api-python-client google-auth google-auth-oauthlib requests pandas pytz
 
       - name: Run generator
+      - name: Upload renders as artifact
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: renders
+    path: renders/**/*.mp4
+    retention-days: 3
+
         env:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
