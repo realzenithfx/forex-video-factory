@@ -1,93 +1,75 @@
-# make_videos.py — Forex Voyage Shorts factory
-# Reads prompts.csv, builds 9:16 videos with Pexels b-roll + Audio Library music,
-# uploads to YouTube as PRIVATE with status.publishAt for scheduled publishing.
+# make_videos.py — Forex Voyage Shorts factory (NEXT-5 scheduler)
+# Schedules the next 5 future rows in prompts.csv each run.
+# Builds 9:16 videos with Pexels b-roll or photos + Audio Library music.
+# Uploads via YouTube Data API: privacy=private, status.publishAt (official scheduling method).
 
 import os, csv, json, random, math, time, subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
-
-import requests
+from datetime import datetime
 import pytz
-from PIL import Image, ImageDraw, ImageFont
+import requests
 
-from moviepy.editor import (
-    VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip,
-    concatenate_videoclips, ColorClip
-)
-from moviepy.video.fx.all import crop, resize
+from PIL import Image, ImageDraw, ImageFont
+from moviepy.editor import (VideoFileClip, ImageClip, AudioFileClip,
+                            CompositeVideoClip, concatenate_videoclips, ColorClip)
+from moviepy.video.fx.all import crop
 from moviepy.audio.fx.all import volumex
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
-# --- Config ---
+# ---------- Config ----------
 CSV_PATH = Path("prompts.csv")
 MUSIC_DIR = Path("music")
 OUT_DIR = Path("renders")
 TMP_DIR = Path("tmp")
 STATE_FILE = Path("posted_state.json")
 
-PUBLISH_WINDOW_MIN = 60  # schedule rows whose PublishTime_Pacific is within next hour
-TARGET_DURATION = 32      # seconds (final short length)
-W, H = 1080, 1920         # 9:16
+TARGET_DURATION = 32  # seconds
+W, H = 1080, 1920     # 9:16
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 YT_CLIENT_ID = os.getenv("YT_CLIENT_ID", "")
 YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET", "")
 YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN", "")
 
-# --- Helpers ---
+# ---------- Utilities ----------
 def ensure_dirs():
     OUT_DIR.mkdir(exist_ok=True)
     TMP_DIR.mkdir(exist_ok=True)
+
+def pacific_tz():
+    return pytz.timezone("America/Los_Angeles")
+
+def utc_now():
+    return datetime.now(pytz.utc)
+
+def parse_pt(dt_str):
+    # expects "YYYY-MM-DD HH:MM" in Pacific time
+    tz = pacific_tz()
+    dt_naive = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+    return tz.localize(dt_naive)
+
+def to_utc_rfc3339_from_pt(dt_str):
+    return parse_pt(dt_str).astimezone(pytz.utc).isoformat()
 
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return {"posted": []}
 
-def save_and_commit_state(state, message="update posting state"):
+def save_and_commit_state(state, message):
     STATE_FILE.write_text(json.dumps(state, indent=2))
-    # Commit so state persists across runs
     try:
-        subprocess.run(["git", "config", "user.email", "bot@github.actions"],
-                       check=True)
-        subprocess.run(["git", "config", "user.name", "gh-actions-bot"],
-                       check=True)
+        subprocess.run(["git", "config", "user.email", "bot@github.actions"], check=True)
+        subprocess.run(["git", "config", "user.name", "gh-actions-bot"], check=True)
         subprocess.run(["git", "add", str(STATE_FILE)], check=True)
         subprocess.run(["git", "commit", "-m", message], check=True)
         subprocess.run(["git", "push"], check=True)
     except Exception as e:
         print("State commit skipped:", e)
-
-def pacific_now():
-    tz = pytz.timezone("America/Los_Angeles")
-    return datetime.now(tz)
-
-def to_utc_rfc3339_from_pacific_str(s):
-    # s like "YYYY-MM-DD HH:MM"
-    tz = pytz.timezone("America/Los_Angeles")
-    dt_naive = datetime.strptime(s, "%Y-%m-%d %H:%M")
-    dt_local = tz.localize(dt_naive)
-    dt_utc = dt_local.astimezone(pytz.utc)
-    return dt_utc.isoformat()
-
-def rows_due_this_hour(rows):
-    """Return rows whose PublishTime_Pacific is within [now, now+PUBLISH_WINDOW_MIN)."""
-    now_pt = pacific_now()
-    end_pt = now_pt + timedelta(minutes=PUBLISH_WINDOW_MIN)
-    due = []
-    for r in rows:
-        try:
-            dt = pytz.timezone("America/Los_Angeles").localize(
-                datetime.strptime(r["PublishTime_Pacific"], "%Y-%m-%d %H:%M")
-            )
-            if now_pt <= dt < end_pt:
-                due.append(r)
-        except Exception as e:
-            print("Bad date row skipped:", r.get("PublishTime_Pacific"), e)
-    return due
 
 def pick_music():
     if not MUSIC_DIR.exists():
@@ -96,125 +78,96 @@ def pick_music():
     return random.choice(tracks) if tracks else None
 
 # ---------- Pexels ----------
-def pexels_get_vertical_video(keyword):
+def pexels_video(keyword):
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": keyword, "per_page": 5, "orientation": "portrait"}
-    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r = requests.get(url, headers=headers, params={"query": keyword, "per_page": 5, "orientation": "portrait"}, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    for v in data.get("videos", []):
-        # pick the best portrait file
-        files = sorted(v.get("video_files", []), key=lambda f: f.get("width", 0))
-        for f in files:
-            w, h = f.get("width"), f.get("height")
-            link = f.get("link")
-            if w and h and h > w and link:
+    for v in r.json().get("videos", []):
+        for f in sorted(v.get("video_files", []), key=lambda x: x.get("width", 0)):
+            w, h, link = f.get("width"), f.get("height"), f.get("link")
+            if w and h and link and h > w:  # portrait
                 return link
     return None
 
-def pexels_get_photos(keywords, need=5):
+def pexels_photos(q, need=6):
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": keywords, "per_page": max(need, 5), "orientation": "portrait"}
-    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r = requests.get(url, headers=headers, params={"query": q, "per_page": need, "orientation": "portrait"}, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    out = []
-    for p in data.get("photos", []):
+    photos = []
+    for p in r.json().get("photos", []):
         src = p.get("src", {})
         link = src.get("large") or src.get("portrait") or src.get("large2x")
         if link:
-            out.append(link)
-    return out[:need]
+            photos.append(link)
+    return photos[:need]
 
 def download(url, dest: Path):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+            for ch in r.iter_content(8192):
+                if ch:
+                    f.write(ch)
 
-# ---------- Visual assembly ----------
-def render_text_image(text, width, height, font_size=70, fill=(255,255,255), bg=(11,31,59,200)):
-    # Semi-transparent bar with centered text
-    img = Image.new("RGBA", (width, height), (0,0,0,0))
+# ---------- Visuals ----------
+def render_text_img(text, w, h, font_size=64, fill=(255,255,255), bg=(11,31,59,200)):
+    img = Image.new("RGBA", (w, h), (0,0,0,0))
     draw = ImageDraw.Draw(img)
-    # draw bar
-    draw.rectangle([0,0,width,height], fill=bg)
-    # load a default font (Pillow fallback)
+    draw.rectangle([0,0,w,h], fill=bg)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
     except:
         font = ImageFont.load_default()
-    # wrap text
-    lines = []
-    words = text.split()
-    line = ""
-    for w in words:
-        test = (line + " " + w).strip()
-        tw, th = draw.textsize(test, font=font)
-        if tw > width - 80:
+    # simple wrap
+    words, lines, line = text.split(), [], ""
+    for w1 in words:
+        test = (line + " " + w1).strip()
+        if draw.textlength(test, font=font) > w-80:
             lines.append(line)
-            line = w
+            line = w1
         else:
             line = test
-    if line:
-        lines.append(line)
-    y = (height - len(lines)*font_size*1.1)//2
+    if line: lines.append(line)
+    y = int((h - len(lines)*font_size*1.1)/2)
     for ln in lines:
-        tw, th = draw.textsize(ln, font=font)
-        x = (width - tw)//2
+        tw = draw.textlength(ln, font=font)
+        x = int((w - tw)/2)
         draw.text((x,y), ln, font=font, fill=fill)
         y += int(font_size*1.1)
-    p = TMP_DIR / f"text_{int(time.time()*1000)}.png"
+    p = TMP_DIR / f"t_{int(time.time()*1000)}.png"
     img.save(p)
     return str(p)
 
-def build_from_video(vpath, overlay_text):
+def build_from_video(vpath, overlay):
     clip = VideoFileClip(vpath)
-    # center-crop to 9:16 if needed
     w, h = clip.w, clip.h
-    target_ratio = W / H
-    ratio = w / h
-    if abs(ratio - target_ratio) > 0.01:
-        # crop width for portrait
-        new_w = int(h * target_ratio)
-        x1 = max(0, (w - new_w)//2)
+    target_ratio = W/H
+    if abs(w/h - target_ratio) > 0.01:
+        new_w = int(h*target_ratio)
+        x1 = max(0, (w-new_w)//2)
         clip = crop(clip, x1=x1, y1=0, x2=x1+new_w, y2=h)
-    clip = clip.resize((W, H))
-    if clip.duration > TARGET_DURATION:
-        clip = clip.subclip(0, TARGET_DURATION)
+    clip = clip.resize((W,H))
+    if clip.duration < TARGET_DURATION:
+        loops = math.ceil(TARGET_DURATION/clip.duration)
+        clip = concatenate_videoclips([clip]*loops).subclip(0, TARGET_DURATION)
     else:
-        # loop to reach target length
-        loops = math.ceil(TARGET_DURATION / clip.duration)
-        clip = concatenate_videoclips([clip] * loops).subclip(0, TARGET_DURATION)
-
-    # Overlay bar at top
-    bar_h = 200
-    bar = ColorClip(size=(W, bar_h), color=(11,31,59)).set_opacity(0.7).set_duration(TARGET_DURATION).set_position(("center", "top"))
-    txt_img = render_text_image(overlay_text, W, bar_h, font_size=64)
-    txt = ImageClip(txt_img).set_duration(TARGET_DURATION).set_position(("center","top"))
+        clip = clip.subclip(0, TARGET_DURATION)
+    bar = ColorClip((W,200), color=(11,31,59)).set_duration(TARGET_DURATION).set_opacity(0.7).set_position(("center","top"))
+    txt = ImageClip(render_text_img(overlay, W, 200)).set_duration(TARGET_DURATION).set_position(("center","top"))
     return CompositeVideoClip([clip, bar, txt])
 
-def build_from_photos(paths, overlay_text):
-    # create simple slideshow
-    per = max(5, int(TARGET_DURATION / max(1, len(paths))))
-    clips = []
-    for p in paths:
-        ic = ImageClip(p).resize(height=H).resize(width=W).set_duration(per)
-        clips.append(ic)
-    # ensure we hit target duration
+def build_from_photos(paths, overlay):
+    per = max(5, int(TARGET_DURATION / max(1,len(paths))))
+    clips = [ImageClip(p).resize(height=H).resize(width=W).set_duration(per) for p in paths]
     video = concatenate_videoclips(clips).subclip(0, TARGET_DURATION)
-    bar_h = 200
-    bar = ColorClip(size=(W, bar_h), color=(11,31,59)).set_opacity(0.7).set_duration(TARGET_DURATION).set_position(("center", "top"))
-    txt_img = render_text_image(overlay_text, W, bar_h, font_size=64)
-    txt = ImageClip(txt_img).set_duration(TARGET_DURATION).set_position(("center","top"))
+    bar = ColorClip((W,200), color=(11,31,59)).set_duration(TARGET_DURATION).set_opacity(0.7).set_position(("center","top"))
+    txt = ImageClip(render_text_img(overlay, W, 200)).set_duration(TARGET_DURATION).set_position(("center","top"))
     return CompositeVideoClip([video, bar, txt])
 
 # ---------- YouTube ----------
-def youtube_service():
+def yt_service():
     creds = Credentials(
         None,
         refresh_token=YT_REFRESH_TOKEN,
@@ -225,147 +178,123 @@ def youtube_service():
     )
     return build("youtube", "v3", credentials=creds)
 
-def youtube_upload_and_schedule(file_path, title, description, publish_at_rfc3339, tags=None):
-    yt = youtube_service()
+def yt_upload(file_path, title, description, publish_at_rfc3339, tags=None):
+    yt = yt_service()
     body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "categoryId": "27",  # Education
-            "tags": tags or [],
-        },
-        "status": {
-            "privacyStatus": "private",      # must be PRIVATE for publishAt to work
-            "publishAt": publish_at_rfc3339, # RFC3339 UTC
-            "selfDeclaredMadeForKids": False
-        }
+        "snippet": {"title": title, "description": description, "categoryId": "27", "tags": tags or []},
+        "status": {"privacyStatus": "private", "publishAt": publish_at_rfc3339, "selfDeclaredMadeForKids": False}
     }
     media = MediaFileUpload(file_path, chunksize=-1, resumable=True, mimetype="video/mp4")
-    request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
+    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+    resp = None
+    while resp is None:
+        status, resp = req.next_chunk()
         if status:
-            print(f"Uploaded {int(status.progress() * 100)}%")
-    vid = response.get("id")
-    print("YouTube video id:", vid)
-    return vid
+            print(f"Uploaded {int(status.progress()*100)}%")
+    return resp.get("id")
 
 # ---------- Main ----------
 def main():
     ensure_dirs()
-
     if not CSV_PATH.exists():
-        print("prompts.csv not found. Add it to the repo root.")
+        print("prompts.csv not found in repo root.")
         return
 
-    # Load state
     state = load_state()
+    rows = list(csv.DictReader(CSV_PATH.open(encoding="utf-8", newline="")))
+    now_pt = pacific_tz().fromutc(utc_now().replace(tzinfo=pytz.utc))  # for logging only
+    print("Now (Pacific):", now_pt.strftime("%Y-%m-%d %H:%M"))
 
-    # Read CSV
-    with CSV_PATH.open(encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
+    # Pick NEXT 5 future rows not yet posted
+    future = []
+    for r in rows:
+        try:
+            dt = parse_pt(r["PublishTime_Pacific"])
+        except Exception as e:
+            print("Bad date in row, skipping:", r.get("PublishTime_Pacific"), e); continue
+        key = f"{r['PublishTime_Pacific']}|{r['Title']}"
+        if key in state["posted"]: continue
+        if dt > pacific_tz().localize(datetime.now()):  # future only
+            future.append((dt, r))
+    future.sort(key=lambda x: x[0])
+    todo = [r for _, r in future[:5]]
 
-    due = rows_due_this_hour(rows)
-    print(f"Due this hour (Pacific): {len(due)} row(s)")
-
-    if not due:
+    print(f"Scheduling this run: {len(todo)} video(s).")
+    if not todo:
         return
 
-    for r in due:
-        # dedupe key
+    for r in todo:
         key = f"{r['PublishTime_Pacific']}|{r['Title']}"
-        if key in state["posted"]:
-            print("Already posted, skipping:", key)
-            continue
-
-        title = r.get("Title", "Forex Voyage")
+        title = r.get("Title") or "Forex Voyage"
         overlay = r.get("OverlayText") or title
-        script = r.get("Prompt_or_Script", "")
-        hashtags = r.get("Hashtags", "")
-        cta = r.get("CTA", "Education only. This promotes my company, ZenithFX.")
-        keywords = r.get("Broll_Keywords", "forex charts;world map").split(";")
-        keyword = keywords[0]
+        script = r.get("Prompt_or_Script") or ""
+        hashtags = r.get("Hashtags","")
+        tags = [t.strip("# ") for t in hashtags.split() if t.startswith("#")]
+        link = r.get("ZenithFX_Link") or "https://zenithfx.com/"
+        desc = "\n".join(filter(None, [
+            script.strip(),
+            "",
+            "Education only — not financial advice.",
+            "This video promotes my company, ZenithFX.",
+            "",
+            r.get("CTA","").strip(),
+            link,
+            hashtags
+        ]))
 
-        # 1) Try Pexels video
-        vurl = None
+        # media
+        keywords = (r.get("Broll_Keywords") or "forex charts;world map").split(";")
         try:
-            vurl = pexels_get_vertical_video(keyword)
+            vurl = pexels_video(keywords[0])
         except Exception as e:
-            print("Pexels video search failed:", e)
+            print("Pexels video search failed:", e); vurl = None
 
-        clip_path = None
         final = None
         try:
             if vurl:
-                clip_path = TMP_DIR / f"pexels_{int(time.time())}.mp4"
-                download(vurl, clip_path)
-                final = build_from_video(str(clip_path), overlay)
+                vp = TMP_DIR / f"pv_{int(time.time())}.mp4"
+                download(vurl, vp)
+                final = build_from_video(str(vp), overlay)
             else:
-                # 2) fallback: photos slideshow
                 photos = []
                 for kw in keywords:
                     try:
-                        photos += pexels_get_photos(kw, need=3)
+                        photos += pexels_photos(kw, need=3)
                     except Exception as e:
                         print("Pexels photos failed for", kw, e)
                 if not photos:
-                    print("No media found; skipping row:", key)
-                    continue
-                photo_paths = []
-                for i, url in enumerate(photos[:6]):
+                    print("No media found; skipping:", key); continue
+                fps = []
+                for i, u in enumerate(photos[:6]):
                     p = TMP_DIR / f"ph_{i}_{int(time.time())}.jpg"
-                    download(url, p)
-                    photo_paths.append(str(p))
-                final = build_from_photos(photo_paths, overlay)
+                    download(u, p); fps.append(str(p))
+                final = build_from_photos(fps, overlay)
 
             # audio
-            music = pick_music()
-            if music:
-                a = AudioFileClip(str(music))
-                a = volumex(a, 0.18)  # gentle background
+            m = pick_music()
+            if m:
+                a = AudioFileClip(str(m)).fx(volumex, 0.18)
                 final = final.set_audio(a)
 
-            # export mp4
-            safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in title)[:50]
-            out_file = OUT_DIR / f"{safe_name}_{r['PublishTime_Pacific'].replace(' ','_').replace(':','-')}.mp4"
-            final.write_videofile(str(out_file), fps=30, codec="libx264", audio_codec="aac", threads=4, preset="medium")
+            # export
+            safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in title)[:50]
+            out_file = OUT_DIR / f"{safe}_{r['PublishTime_Pacific'].replace(' ','_').replace(':','-')}.mp4"
+            final.write_videofile(str(out_file), fps=30, codec="libx264", audio_codec="aac", preset="medium", threads=4)
 
-            # build description
-            desc_lines = [
-                script.strip(),
-                "",
-                "Education only — not financial advice.",
-                "This video promotes my company, ZenithFX.",
-                "",
-                r.get("CTA","").strip(),
-            ]
-            link = r.get("ZenithFX_Link") or "https://zenithfx.com/"
-            desc_lines.append(link)
-            if hashtags:
-                desc_lines.append(hashtags)
-            description = "\n".join([d for d in desc_lines if d])
-
-            # schedule
-            publish_at = to_utc_rfc3339_from_pacific_str(r["PublishTime_Pacific"])
-            tags = [t.strip("# ") for t in hashtags.split() if t.startswith("#")]
-
-            vid = youtube_upload_and_schedule(
-                str(out_file), title, description, publish_at, tags=tags
-            )
-
-            # record state
-            state["posted"].append(key)
-            save_and_commit_state(state, message=f"mark posted {key} -> {vid}")
-
-            print("DONE:", key, "->", vid)
-
+            publish_at = to_utc_rfc3339_from_pt(r["PublishTime_Pacific"])
+            try:
+                vid = yt_upload(str(out_file), title, desc, publish_at, tags=tags)
+                print("YouTube video id:", vid)
+                state["posted"].append(key)
+                save_and_commit_state(state, f"posted {key} -> {vid}")
+            except HttpError as e:
+                print("YouTube API error:", e)
+                if hasattr(e, "content"):
+                    print("Details:", e.content)
         finally:
             try:
-                if final:
-                    final.close()
-            except:
-                pass
+                if final: final.close()
+            except: pass
 
 if __name__ == "__main__":
     main()
