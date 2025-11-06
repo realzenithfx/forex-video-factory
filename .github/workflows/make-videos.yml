@@ -1,25 +1,24 @@
 name: Make & Upload Forex Videos (FREE)
 
 on:
-  # Run hourly; the Python script will decide what to publish now.
   schedule:
-    - cron: '5 * * * *'   # Every hour (GitHub Actions uses UTC)
-  workflow_dispatch: {}     # Manual Run button
+    - cron: '5 * * * *'   # run hourly (UTC)
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # allow the script to commit posted_state.json
 
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-        # Official action page: https://github.com/actions/checkout
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-        # Official action page: https://github.com/actions/setup-python
 
       - name: Install system tools (FFmpeg)
         run: |
@@ -29,21 +28,20 @@ jobs:
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
-          pip install moviepy google-api-python-client google-auth google-auth-oauthlib requests pandas pytz
+          pip install moviepy Pillow google-api-python-client google-auth google-auth-oauthlib requests pandas pytz
 
       - name: Run generator
-      - name: Upload renders as artifact
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: renders
-    path: renders/**/*.mp4
-    retention-days: 3
-
         env:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-        run: |
-          python make_videos.py
+        run: python make_videos.py
+
+      - name: Upload renders as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renders
+          path: renders/**/*.mp4
+          retention-days: 3
