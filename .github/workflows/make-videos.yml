@@ -2,14 +2,15 @@ name: Make & Upload Forex Videos (FREE)
 
 on:
   schedule:
-    - cron: '5 * * * *'   # run hourly (UTC)
+    - cron: '5 * * * *'   # hourly (UTC). Script schedules exact publishAt times.
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # allow the script to commit posted_state.json
+      contents: write
+
 
     steps:
       - name: Check out repo
