@@ -1,0 +1,10 @@
+moviepy==1.0.3
+imageio>=2.34
+imageio-ffmpeg>=0.4
+Pillow>=10.0
+requests>=2.31
+pytz>=2024.1
+google-api-python-client>=2.130
+google-auth>=2.35
+google-auth-oauthlib>=1.2
+pandas>=2.2
